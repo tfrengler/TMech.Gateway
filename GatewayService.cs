@@ -11,6 +11,27 @@ using System.Threading.Tasks;
 
 namespace TMech.Gateway;
 
+/*
+ * Listen for HTTP requests
+ * If OPTION then pass through
+ * Otherwise check for custom headers
+ * Reject if headers are not present
+ * Reject if headers are present but do not match any known service/endpoint
+ * Proxy request via HttpClient HttpRequestMessage
+ * Copy headers and status code
+ * Copy body (conditionally)
+ * 
+ * 
+ * HandleRequest
+ * HandleRequestHEAD
+ * HandleRequestORIGIN
+ * 
+ * TryGetRoutingInfo => service (endpoint?)
+ * ProxyRequest(serviceUrl) => client, response
+ * CopyProxyResponseHeadersAndStatus
+ * CopyProxyResponseBody
+ */
+
 public sealed class GatewayService : BackgroundService
 {
     const int MaxConcurrentRequests = 8;
@@ -51,27 +72,22 @@ public sealed class GatewayService : BackgroundService
     {
         _listener.Prefixes.Add(_listenAddress);
         _listener.Start();
-        _ = Receive();
 
         _logger.LogInformation("Gateway listening on: {Adress}", _listenAddress);
-        
-        while (!stoppingToken.IsCancellationRequested) { }
-    }
 
-    private async Task Receive()
-    {
-        while (!_shuttingDown)
+        do
         {
             try
             {
                 var context = await _listener.GetContextAsync();
                 _ = Task.Run(() => ProcessRequest(context));
             }
-            catch(HttpListenerException)
+            catch (HttpListenerException)
             {
                 break;
             }
         }
+        while (!stoppingToken.IsCancellationRequested);
     }
 
     private async Task ProcessRequest(HttpListenerContext context)
@@ -90,26 +106,18 @@ public sealed class GatewayService : BackgroundService
 
         try 
         {
-            if (request.HttpMethod != "OPTIONS")
+            Func<HttpListenerRequest, HttpListenerResponse, Task> requestHandler = request.HttpMethod switch
             {
-                string[]? targetAppId = request.Headers.GetValues(AppTargetCustomHeader);
+                "OPTIONS" => HandleRequestOPTIONS,
+                "HEAD" => HandleRequestHEAD,
+                _ => HandleRequest
+            };
 
-                if (targetAppId is null || targetAppId?.Length == 0)
-                {
-                    _logger.LogWarning($"REJECTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
-                    response.StatusCode = 418;
-                    response.Close();
-
-                    return;
-                }
-            }
-
-            _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
-            await ProxyRequest(request, response);
+            await requestHandler(request, response);
         }
         catch(Exception error)
         {
-            _logger.LogError("PreprocessRequest failure: {Error} {StackTrace}", error.Message, Environment.NewLine + error.StackTrace);
+            _logger.LogError("PreprocessRequest failure: {Error}{StackTrace}", error.Message, Environment.NewLine + error.StackTrace);
             response.StatusCode = 502;
         }
         finally
@@ -119,41 +127,79 @@ public sealed class GatewayService : BackgroundService
         }
     }
 
-    private async Task ProxyRequest(HttpListenerRequest request, HttpListenerResponse response)
+    private async Task HandleRequestOPTIONS(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+
+        response.AddHeader("Access-Control-Allow-Origin", "*");
+        response.AddHeader("Access-Control-Allow-Headers", "x-gateway-target-appId");
+
+        var proxyResponse = await ProxyRequest(request);
+        CopyProxyResponseHeadersAndStatus(response, proxyResponse);
+        response.Close();
+    }
+
+    private async Task HandleRequestHEAD(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+
+        var proxyResponse = await ProxyRequest(request);
+        CopyProxyResponseHeadersAndStatus(response, proxyResponse);
+
+        foreach (var header in proxyResponse.Content.Headers)
+        {
+            response.Headers[header.Key] = string.Join(",", header.Value);
+        }
+
+        response.Close();
+    }
+
+    private async Task HandleRequest(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+
+        response.AddHeader("Access-Control-Allow-Origin", "*");
+        response.AddHeader("Access-Control-Allow-Headers", "x-gateway-target-appId");
+
+        var proxyResponse = await ProxyRequest(request);
+        CopyProxyResponseHeadersAndStatus(response, proxyResponse);
+        await CopyProxyResponseBody(response, proxyResponse);
+
+        response.Close();
+    }
+
+    private async Task<HttpResponseMessage> ProxyRequest(HttpListenerRequest request)
     {
         HttpRequestMessage proxyRequest = CopyRequest(request);
-        HttpResponseMessage proxyResponse = null!;
         var httpClient = new HttpClient(_httpHandler, false);
 
         try
         {
-            proxyResponse = await httpClient
+            HttpResponseMessage proxyResponse = await httpClient
                 .SendAsync(proxyRequest, HttpCompletionOption.ResponseHeadersRead)
                 .ConfigureAwait(false);
 
-            await CopyResponse(response, proxyResponse);
-
-            response.AddHeader("Access-Control-Allow-Origin", "*");
-            response.AddHeader("Access-Control-Allow-Headers", "x-gateway-target-appId");
+            return proxyResponse;
         }
         finally
         {
             httpClient?.Dispose();
-            proxyResponse?.Dispose();
         }
     }
 
-    private async Task CopyResponse(HttpListenerResponse response, HttpResponseMessage proxyResponse)
+    private static void CopyProxyResponseHeadersAndStatus(HttpListenerResponse response, HttpResponseMessage proxyResponse)
     {
         response.StatusCode = (int)proxyResponse.StatusCode;
+        response.ContentType = proxyResponse.Content.Headers.ContentType?.ToString();
 
         foreach (var header in proxyResponse.Headers)
         {
             response.Headers[header.Key] = string.Join(",", header.Value);
         }
+    }
 
-        response.ContentType = proxyResponse.Content.Headers.ContentType?.ToString();
-
+    private static async Task CopyProxyResponseBody(HttpListenerResponse response, HttpResponseMessage proxyResponse)
+    {
         using (Stream proxyResponseStream = await proxyResponse.Content.ReadAsStreamAsync())
         {
             await proxyResponseStream.CopyToAsync(response.OutputStream);
@@ -196,5 +242,39 @@ public sealed class GatewayService : BackgroundService
         }
 
         return returnData;
+    }
+
+    private void RejectRequest(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        _logger.LogWarning($"REJECTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+        response.StatusCode = 418;
+        response.Close();
+    }
+
+    private static HttpMethod GetHttpMethodFromString(string methodName)
+    {
+        return methodName switch
+        {
+            "GET" => HttpMethod.Get,
+            "POST" => HttpMethod.Post,
+            "PUT" => HttpMethod.Put,
+            "DELETE" => HttpMethod.Delete,
+            "OPTIONS" => HttpMethod.Options,
+            "PATCH" => HttpMethod.Patch,
+            "HEAD" => HttpMethod.Head,
+            _ => throw new NotImplementedException("Wrong or not caught by Thomas http method?")
+        };
+    }
+
+    private object TryGetRoutingInfo(WebHeaderCollection headers)
+    {
+        string[]? targetAppId = headers.GetValues(AppTargetCustomHeader);
+
+        if (targetAppId is null || targetAppId?.Length == 0)
+        {
+            return 0;
+        }
+
+        return 1;
     }
 }
