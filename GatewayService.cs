@@ -59,6 +59,8 @@ public sealed class GatewayService : BackgroundService
         TimeSpan timeout = TimeSpan.FromSeconds(5);
         var timeoutTimer = Stopwatch.StartNew();
 
+        _logger.LogInformation("Stopping... ({RequestsStillInFlight} requests still in flight)", MaxConcurrentRequests - _semaphore.CurrentCount);
+
         while (timeoutTimer.Elapsed < timeout && _semaphore.CurrentCount != MaxConcurrentRequests)
         {
             await Task.Delay(100);
@@ -73,17 +75,21 @@ public sealed class GatewayService : BackgroundService
         _listener.Prefixes.Add(_listenAddress);
         _listener.Start();
 
-        _logger.LogInformation("Gateway listening on: {Adress}", _listenAddress);
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("Gateway listening on: {Adress}", _listenAddress);
+        }
 
         do
         {
             try
             {
-                var context = await _listener.GetContextAsync();
-                _ = Task.Run(() => ProcessRequest(context));
+                var context = await _listener.GetContextAsync().ConfigureAwait(false);
+                _ = Task.Run(() => ProcessRequest(context), CancellationToken.None);
             }
             catch (HttpListenerException)
             {
+                // Noop, exception only thrown by GetContextAsync when the listener is stopped 
                 break;
             }
         }
@@ -93,16 +99,18 @@ public sealed class GatewayService : BackgroundService
     private async Task ProcessRequest(HttpListenerContext context)
     {
         if (_shuttingDown) return;
-        bool didNotTimeOut = await _semaphore.WaitAsync(TimeSpan.FromSeconds(30));
+
+        var timeout = TimeSpan.FromSeconds(30);
+        bool didNotTimeOut = await _semaphore.WaitAsync(timeout);
 
         if (!didNotTimeOut)
         {
-            _logger.LogWarning("Request timed out waiting to be processed");
+            _logger.LogWarning("Request timed out waiting to be processed ({Timeout})", timeout);
             return;
         }
 
-        var request = context.Request;
-        var response = context.Response;
+        HttpListenerRequest request = context.Request;
+        HttpListenerResponse response = context.Response;
 
         try 
         {
@@ -117,31 +125,40 @@ public sealed class GatewayService : BackgroundService
         }
         catch(Exception error)
         {
-            _logger.LogError("PreprocessRequest failure: {Error}{StackTrace}", error.Message, Environment.NewLine + error.StackTrace);
+            _logger.LogError("HandleRequest failure: {Error}{StackTrace}", error.Message, Environment.NewLine + error.StackTrace);
             response.StatusCode = 502;
+            response.Close();
         }
         finally
         {
-            response.Close();
             _semaphore.Release();
         }
     }
 
     private async Task HandleRequestOPTIONS(HttpListenerRequest request, HttpListenerResponse response)
     {
-        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+        _logger.LogInformation($"PRE-FLIGHT: ({request.RemoteEndPoint}) {request.Url}");
 
+        //response.AddHeader("Access-Control-Allow-Origin", "http://192.168.178.27");
         response.AddHeader("Access-Control-Allow-Origin", "*");
-        response.AddHeader("Access-Control-Allow-Headers", "x-gateway-target-appId");
+        response.AddHeader("Access-Control-Allow-Headers", AppTargetCustomHeader);
+        response.AddHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH");
 
         var proxyResponse = await ProxyRequest(request);
         CopyProxyResponseHeadersAndStatus(response, proxyResponse);
-        response.Close();
+
+        await FinishRequest(request, response);
     }
 
     private async Task HandleRequestHEAD(HttpListenerRequest request, HttpListenerResponse response)
     {
-        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+        if (!TryGetRoutingInfo((WebHeaderCollection)request.Headers, out string serviceName))
+        {
+            await RejectRequest(request, response);
+            return;
+        }
+
+        _logger.LogInformation($"ACCEPTED: ({serviceName}) ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
 
         var proxyResponse = await ProxyRequest(request);
         CopyProxyResponseHeadersAndStatus(response, proxyResponse);
@@ -151,21 +168,25 @@ public sealed class GatewayService : BackgroundService
             response.Headers[header.Key] = string.Join(",", header.Value);
         }
 
-        response.Close();
+        await FinishRequest(request, response);
     }
 
     private async Task HandleRequest(HttpListenerRequest request, HttpListenerResponse response)
     {
-        _logger.LogInformation($"ACCEPTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+        if (!TryGetRoutingInfo((WebHeaderCollection)request.Headers, out string serviceName))
+        {
+            await RejectRequest(request, response);
+            return;
+        }
 
-        response.AddHeader("Access-Control-Allow-Origin", "*");
-        response.AddHeader("Access-Control-Allow-Headers", "x-gateway-target-appId");
+        _logger.LogInformation($"ACCEPTED: ({serviceName}) ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
 
         var proxyResponse = await ProxyRequest(request);
         CopyProxyResponseHeadersAndStatus(response, proxyResponse);
         await CopyProxyResponseBody(response, proxyResponse);
 
-        response.Close();
+        //Thread.Sleep(3000);
+        await FinishRequest(request, response);
     }
 
     private async Task<HttpResponseMessage> ProxyRequest(HttpListenerRequest request)
@@ -244,37 +265,35 @@ public sealed class GatewayService : BackgroundService
         return returnData;
     }
 
-    private void RejectRequest(HttpListenerRequest request, HttpListenerResponse response)
+    private Task RejectRequest(HttpListenerRequest request, HttpListenerResponse response)
     {
         _logger.LogWarning($"REJECTED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
         response.StatusCode = 418;
         response.Close();
+
+        return Task.CompletedTask;
     }
 
-    private static HttpMethod GetHttpMethodFromString(string methodName)
+    private Task FinishRequest(HttpListenerRequest request, HttpListenerResponse response)
     {
-        return methodName switch
-        {
-            "GET" => HttpMethod.Get,
-            "POST" => HttpMethod.Post,
-            "PUT" => HttpMethod.Put,
-            "DELETE" => HttpMethod.Delete,
-            "OPTIONS" => HttpMethod.Options,
-            "PATCH" => HttpMethod.Patch,
-            "HEAD" => HttpMethod.Head,
-            _ => throw new NotImplementedException("Wrong or not caught by Thomas http method?")
-        };
+        _logger.LogInformation($"PROCESSED: ({request.RemoteEndPoint}) {request.HttpMethod} {request.Url}");
+        response.Close();
+
+        return Task.CompletedTask;
     }
 
-    private object TryGetRoutingInfo(WebHeaderCollection headers)
+    private static bool TryGetRoutingInfo(WebHeaderCollection headers, out string serviceName)
     {
-        string[]? targetAppId = headers.GetValues(AppTargetCustomHeader);
+        string[]? targetAppId = headers.GetValues(AppTargetCustomHeader.ToLowerInvariant());
 
-        if (targetAppId is null || targetAppId?.Length == 0)
+        if ((targetAppId?.Length ?? 0) == 0)
         {
-            return 0;
+            serviceName = string.Empty;
+            return false;
         }
 
-        return 1;
+        Debug.Assert(targetAppId is not null);
+        serviceName = targetAppId[0];
+        return true;
     }
 }
